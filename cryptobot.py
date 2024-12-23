@@ -497,12 +497,27 @@ class CryptoMarketAnalyzer:
                 await self._rate_limit_request()
                 markets = await asyncio.to_thread(exchange.load_markets)
                 
+                # Filter out inactive markets if that information is available
+                active_symbols = set()
+                for symbol, market in markets.items():
+                    # Different exchanges might have different ways to mark active markets
+                    is_active = (
+                        market.get('active', True) and  # Some exchanges use 'active'
+                        not market.get('expired', False) and  # Some use 'expired'
+                        not market.get('disabled', False)  # Some use 'disabled'
+                    )
+                    if is_active:
+                        active_symbols.add(symbol)
+                
                 exchange_info[exchange_id] = ExchangeInfo(
                     name=exchange_id,
-                    symbols=set(markets.keys()),
+                    symbols=active_symbols,
                     timeframes=set(exchange.timeframes) if hasattr(exchange, 'timeframes') else set(),
                     has_fetchOHLCV=exchange.has.get('fetchOHLCV', False)
                 )
+                
+                self.logger.info(f"Loaded {len(active_symbols)} active symbols from {exchange_id}")
+                
             except Exception as e:
                 self.logger.error(f"Error loading {exchange_id} info: {e}")
 
@@ -515,6 +530,11 @@ class CryptoMarketAnalyzer:
             self.logger.warning(f"Failed to cache exchange info: {e}")
 
         return exchange_info
+
+    async def get_all_symbols(self) -> Dict[str, Set[str]]:
+        """Get all available symbols for each exchange."""
+        info = await self.load_exchange_info()
+        return {ex_id: ex_info.symbols for ex_id, ex_info in info.items()}
     async def analyze_market(
     self,
     symbol: str,
@@ -713,15 +733,125 @@ class CryptoMarketAnalyzer:
         ]
         choices = [SignalType.STRONG_BUY.value, SignalType.STRONG_SELL.value]
         df['signal'] = np.select(conditions, choices, default=df['signal'])
-    async def get_common_symbols(self) -> Set[str]:
+    async def get_common_symbols(self, min_exchanges: int = None) -> Dict[str, Set[str]]:
+        """
+        Get symbols that are common across exchanges.
+        
+        Args:
+            min_exchanges: Minimum number of exchanges a symbol must be present on.
+                        If None, symbol must be present on all exchanges.
+        
+        Returns:
+            Dict mapping symbols to the set of exchanges they're available on
+        """
         info = await self.load_exchange_info()
         if not info:
-            return set()
+            return {}
         
-        common_symbols = set.intersection(
-            *[ex_info.symbols for ex_info in info.values()]
-        )
+        # Create a dictionary mapping symbols to the exchanges they're available on
+        symbol_exchanges = {}
+        for exchange_id, exchange_info in info.items():
+            for symbol in exchange_info.symbols:
+                if symbol not in symbol_exchanges:
+                    symbol_exchanges[symbol] = set()
+                symbol_exchanges[symbol].add(exchange_id)
+        
+        # Filter based on minimum exchange requirement
+        if min_exchanges is None:
+            min_exchanges = len(info)  # Must be on all exchanges
+        
+        common_symbols = {
+            symbol: exchanges
+            for symbol, exchanges in symbol_exchanges.items()
+            if len(exchanges) >= min_exchanges
+        }
+        
         return common_symbols
+    # Helper method to display symbol availability
+    def print_symbol_availability(self, common_symbols: Dict[str, Set[str]]) -> None:
+        """Print detailed information about symbol availability across exchanges."""
+        if not common_symbols:
+            print("\n❌ No symbols found matching the criteria.")
+            return
+
+        # Sort symbols by number of exchanges they're available on
+        sorted_symbols = sorted(
+            common_symbols.items(),
+            key=lambda x: (len(x[1]), x[0]),
+            reverse=True
+        )
+        
+        print(f"\n📊 Found {len(common_symbols)} symbols matching criteria:")
+        print("\nTop 10 most widely available symbols:")
+        for symbol, exchanges in sorted_symbols[:10]:
+            print(f"- {symbol:<12} Available on {len(exchanges)} exchanges: {', '.join(sorted(exchanges))}")
+        
+        # Group by number of exchanges
+        availability_groups = {}
+        for symbol, exchanges in common_symbols.items():
+            count = len(exchanges)
+            if count not in availability_groups:
+                availability_groups[count] = 0
+            availability_groups[count] += 1
+        
+        print("\nAvailability Summary:")
+        for count in sorted(availability_groups.keys(), reverse=True):
+            print(f"- {availability_groups[count]} symbols available on {count} exchanges")
+
+    async def select_symbol(self, min_exchanges: int = None) -> Tuple[str, Set[str]]:
+        """
+        Interactive symbol selection with detailed availability information.
+        
+        Args:
+            min_exchanges: Minimum number of exchanges required for a symbol
+        
+        Returns:
+            Tuple of (selected symbol, set of exchanges supporting it)
+        """
+        while True:
+            # First show all available symbols
+            all_symbols = await self.get_all_symbols()
+            print("\n📈 Symbol Availability Options:")
+            print("1. Show all symbols from any exchange")
+            print("2. Show symbols available on all exchanges")
+            print(f"3. Show symbols available on at least 2 exchanges")
+            
+            choice = input("\nSelect option (1-3) [default=1]: ").strip() or "1"
+            
+            if choice == "1":
+                min_exchanges = 1
+            elif choice == "2":
+                min_exchanges = len(self.exchanges)
+            elif choice == "3":
+                min_exchanges = 2
+            else:
+                print("❌ Invalid choice, defaulting to option 1")
+                min_exchanges = 1
+                
+            common_symbols = await self.get_common_symbols(min_exchanges)
+            self.print_symbol_availability(common_symbols)
+            
+            # Symbol selection
+            symbol = input("\n📈 Enter the symbol to analyze (e.g., BTC/USDT) or 'back' to change filter: ").strip().upper()
+            
+            if symbol.lower() == 'back':
+                continue
+            if symbol.lower() == 'exit':
+                sys.exit(0)
+                
+            if symbol in common_symbols:
+                return symbol, common_symbols[symbol]
+            else:
+                # Check if it exists in any exchange
+                all_exchanges = set().union(*[symbols for symbols in all_symbols.values()])
+                if symbol in all_exchanges:
+                    supporting_exchanges = {
+                        exchange for exchange, symbols in all_symbols.items()
+                        if symbol in symbols
+                    }
+                    return symbol, supporting_exchanges
+                
+                print(f"❌ Symbol {symbol} not found. Please try another symbol.")
 
 
 async def main():
@@ -742,161 +872,150 @@ async def main():
             ),
             log_level=logging.INFO
         )
+        symbol, supporting_exchanges = await analyzer.select_symbol()
+        print(f"\n✅ Selected {symbol}, available on: {', '.join(sorted(supporting_exchanges))}")
         print("\n🚀 Crypto Market Analyzer initialized successfully!")
     except Exception as e:
         print(f"\n❌ Failed to initialize analyzer: {e}")
         sys.exit(1)
 
-    # Get available symbols
-    try:
-        common_symbols = await analyzer.get_common_symbols()
-        if not common_symbols:
-            print("\n❌ No common symbols found across exchanges.")
-            sys.exit(1)
-
-        print(f"\n📊 Available symbols across exchanges: {len(common_symbols)}")
-        sample_symbols = sorted(list(common_symbols))[:10]
-        print(f"📝 Sample symbols: {', '.join(sample_symbols)}")
-    except Exception as e:
-        print(f"\n❌ Failed to fetch symbols: {e}")
-        sys.exit(1)
-
-    # Symbol selection
     while True:
-        symbol = input("\n📈 Enter the symbol to analyze (e.g., BTC/USDT) or 'exit' to quit: ").strip().upper()
-        if symbol.lower() == 'exit':
-            print("\n👋 Goodbye!")
-            sys.exit(0)
-        if symbol in common_symbols:
-            break
-        print(f"❌ Symbol {symbol} not found. Please choose from the available symbols.")
-
-    # Timeframe selection
-    print("\n⏰ Available timeframes:")
-    timeframes = {
-        '1': TimeFrame.MINUTE_1,
-        '2': TimeFrame.MINUTE_5,
-        '3': TimeFrame.MINUTE_15,
-        '4': TimeFrame.HOUR_1,
-        '5': TimeFrame.HOUR_4,
-        '6': TimeFrame.DAY_1
-    }
-    for key, tf in timeframes.items():
-        print(f"{key}. {tf.value}")
-
-    while True:
-        choice = input("Select timeframe (1-6) [default=4]: ").strip()
-        if not choice:
-            choice = '4'
-        if choice in timeframes:
-            timeframe = timeframes[choice]
-            break
-        print("❌ Invalid choice. Please select a number between 1 and 6.")
-
-    # Analysis options
-    print("\n🔧 Configuration options:")
-    include_predictions = input("Include price predictions? (y/n) [default=y]: ").strip().lower() != 'n'
-    save_plot = input("Save analysis plot? (y/n) [default=y]: ").strip().lower() != 'n'
-    save_csv = input("Save analysis results to CSV? (y/n) [default=y]: ").strip().lower() != 'n'
-
-    # Execute analysis
-    try:
-        print(f"\n🔄 Analyzing {symbol} with {timeframe.value} timeframe...")
-        
-        # Set up file paths
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        plot_path = f"analysis_{symbol.replace('/', '_')}_{timestamp}.png" if save_plot else None
-        csv_path = f"analysis_{symbol.replace('/', '_')}_{timestamp}.csv" if save_csv else None
-
-        # Perform market analysis
-        analysis_results = await analyzer.analyze_market(
-            symbol=symbol,
-            timeframe=timeframe,
-            limit=500,
-            save_plot=save_plot,
-            plot_path=plot_path,
-            include_predictions=include_predictions
-        )
-
-        print(f"\n✅ Analysis completed successfully!")
-
-        # Display key metrics
-        print("\n📊 Key Metrics:")
-        latest_data = analysis_results.iloc[-1]
-        print(f"Current Price: ${latest_data['close']:.2f}")
-        print(f"RSI: {latest_data['rsi']:.2f}")
-        print(f"Signal: {latest_data['signal']}")
-        print(f"24h Volume: {latest_data['volume']:.2f}")
-
-        # Save results
-        if save_csv and csv_path:
-            analysis_results.to_csv(csv_path)
-            print(f"\n💾 Analysis results saved to: {csv_path}")
-        
-        if save_plot and plot_path:
-            print(f"📸 Analysis plot saved to: {plot_path}")
-
-        # Additional analysis options
-        while True:
-            print("\n📋 Additional options:")
-            print("1. Show detailed statistics")
-            print("2. Export additional timeframe analysis")
-            print("3. Show price predictions")
+        try:
+            print("\n🔍 Symbol Search Options:")
+            print("1. View all available symbols")
+            print("2. Search by symbol name")
+            print("3. Show most traded symbols")
             print("4. Exit")
 
             choice = input("\nSelect option (1-4): ").strip()
 
+            if choice == '4':
+                print("\n👋 Goodbye!")
+                sys.exit(0)
+
             if choice == '1':
-                print("\n📊 Detailed Statistics:")
-                print(analysis_results.describe())
-            
+                # Get all symbols from each exchange
+                all_symbols = await analyzer.get_all_symbols()
+                print("\n📊 Available Symbols by Exchange:")
+                for exchange, symbols in all_symbols.items():
+                    print(f"\n{exchange.upper()}:")
+                    # Sort and display symbols in columns
+                    sorted_symbols = sorted(list(symbols))
+                    for i in range(0, len(sorted_symbols), 5):
+                        print("  ".join(f"{s:<12}" for s in sorted_symbols[i:i+5]))
+                    print(f"Total: {len(symbols)} symbols")
+
             elif choice == '2':
-                for tf in TimeFrame:
-                    if tf != timeframe:
-                        try:
-                            additional_analysis = await analyzer.analyze_market(
-                                symbol=symbol,
-                                timeframe=tf,
-                                limit=100,
-                                save_plot=True,
-                                plot_path=f"analysis_{symbol.replace('/', '_')}_{tf.value}_{timestamp}.png"
-                            )
-                            print(f"✅ {tf.value} analysis completed and saved")
-                        except Exception as e:
-                            print(f"❌ Failed to analyze {tf.value}: {e}")
+                search_term = input("\nEnter search term (e.g., 'BTC' or 'ETH'): ").strip().upper()
+                all_symbols = await analyzer.get_all_symbols()
+                
+                matching_symbols = {}
+                for exchange, symbols in all_symbols.items():
+                    matches = {s for s in symbols if search_term in s}
+                    if matches:
+                        matching_symbols[exchange] = matches
+
+                if matching_symbols:
+                    print(f"\n🔍 Found matching symbols:")
+                    for exchange, symbols in matching_symbols.items():
+                        print(f"\n{exchange.upper()}:")
+                        for symbol in sorted(symbols):
+                            print(f"  {symbol}")
+                else:
+                    print(f"\n❌ No symbols found matching '{search_term}'")
+                    continue
 
             elif choice == '3':
-                if include_predictions:
-                    print("\n🔮 Price predictions were included in the analysis")
-                else:
-                    print("\n❌ Price predictions were not included in the initial analysis")
-                    if input("Would you like to run predictions now? (y/n): ").strip().lower() == 'y':
-                        # Get historical data for predictions
-                        end_date = datetime.now()
-                        start_date = end_date - timedelta(days=365)
-                        historical_data = await analyzer.fetch_historical_data(
-                            exchange_id='binance',  # Using Binance as default
-                            symbol=symbol,
-                            timeframe=TimeFrame.DAY_1,
-                            start_date=start_date.strftime("%Y-%m-%d"),
-                            end_date=end_date.strftime("%Y-%m-%d")
-                        )
-                        
-                        prediction_dates, predictions = await analyzer.predict_prices(historical_data)
-                        print("\n📈 Price predictions for the next 7 days:")
-                        for date, price in zip(prediction_dates, predictions):
-                            print(f"{date}: ${price:.2f}")
+                print("\nFetching most traded symbols...")
+                common_symbols = await analyzer.get_common_symbols(min_exchanges=2)
+                analyzer.print_symbol_availability(common_symbols)
 
-            elif choice == '4':
-                print("\n👋 Thanks for using the Crypto Market Analyzer!")
-                break
+            # Symbol selection
+            symbol, supporting_exchanges = await analyzer.select_symbol()
             
+            # Exchange selection
+            if len(supporting_exchanges) > 1:
+                print(f"\n📈 {symbol} is available on multiple exchanges:")
+                for i, exchange in enumerate(sorted(supporting_exchanges), 1):
+                    print(f"{i}. {exchange}")
+                
+                while True:
+                    exchange_choice = input(f"\nSelect exchange (1-{len(supporting_exchanges)}) [default=1]: ").strip() or "1"
+                    try:
+                        selected_exchange = sorted(supporting_exchanges)[int(exchange_choice) - 1]
+                        break
+                    except (ValueError, IndexError):
+                        print("❌ Invalid choice. Please try again.")
             else:
-                print("❌ Invalid choice. Please select a number between 1 and 4.")
+                selected_exchange = next(iter(supporting_exchanges))
 
-    except Exception as e:
-        print(f"\n❌ Error during analysis: {e}")
-        sys.exit(1)
+            print(f"\n📊 Selected {symbol} on {selected_exchange}")
+
+            # Timeframe selection
+            print("\n⏰ Available timeframes:")
+            timeframes = {
+                '1': TimeFrame.MINUTE_1,
+                '2': TimeFrame.MINUTE_5,
+                '3': TimeFrame.MINUTE_15,
+                '4': TimeFrame.HOUR_1,
+                '5': TimeFrame.HOUR_4,
+                '6': TimeFrame.DAY_1
+            }
+            for key, tf in timeframes.items():
+                print(f"{key}. {tf.value}")
+
+            timeframe_choice = input("\nSelect timeframe (1-6) [default=4]: ").strip() or "4"
+            timeframe = timeframes.get(timeframe_choice, TimeFrame.HOUR_1)
+
+            # Analysis options
+            print("\n⚙️ Analysis Configuration:")
+            include_predictions = input("Include price predictions? (y/n) [default=y]: ").strip().lower() != 'n'
+            save_plot = input("Save analysis plot? (y/n) [default=y]: ").strip().lower() != 'n'
+            save_csv = input("Save analysis results to CSV? (y/n) [default=y]: ").strip().lower() != 'n'
+
+            # Execute analysis
+            print(f"\n🔄 Analyzing {symbol} on {selected_exchange} with {timeframe.value} timeframe...")
+            
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            plot_path = f"analysis_{symbol.replace('/', '_')}_{timestamp}.png" if save_plot else None
+            csv_path = f"analysis_{symbol.replace('/', '_')}_{timestamp}.csv" if save_csv else None
+
+            analysis_results = await analyzer.analyze_market(
+                symbol=symbol,
+                timeframe=timeframe,
+                limit=500,
+                save_plot=save_plot,
+                plot_path=plot_path,
+                include_predictions=include_predictions
+            )
+
+            print("\n✅ Analysis completed!")
+
+            # Display results
+            latest = analysis_results.iloc[-1]
+            print("\n📊 Current Market Status:")
+            print(f"Price: ${latest['close']:.2f}")
+            print(f"Signal: {latest['signal']}")
+            print(f"RSI: {latest['rsi']:.2f}")
+            print(f"Volume: {latest['volume']:.2f}")
+
+            if save_csv and csv_path:
+                print(f"\n💾 Analysis saved to: {csv_path}")
+            if save_plot and plot_path:
+                print(f"📊 Plot saved to: {plot_path}")
+
+            # Ask if user wants to analyze another symbol
+            if input("\nAnalyze another symbol? (y/n) [default=y]: ").strip().lower() == 'n':
+                print("\n👋 Thanks for using Crypto Market Analyzer!")
+                break
+
+        except KeyboardInterrupt:
+            print("\n\n👋 Program interrupted. Goodbye!")
+            break
+        except Exception as e:
+            print(f"\n❌ Error: {e}")
+            if input("\nTry again? (y/n) [default=y]: ").strip().lower() == 'n':
+                break
 
 if __name__ == "__main__":
     asyncio.run(main())
